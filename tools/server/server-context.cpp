@@ -26,6 +26,12 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <map>
+#include <mutex>
+#include <chrono>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -37,6 +43,133 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// Collect only the small integer tensor containing the selected MoE expert IDs.
+// This callback is intentionally opt-in: observing graph nodes adds synchronization.
+struct server_moe_routing_collector {
+    std::mutex mutex;
+    std::string path;
+    std::map<int, std::vector<uint64_t>> expert_counts;
+    std::map<int, uint64_t> routed_token_rows;
+    uint64_t observed_tensors = 0;
+    std::chrono::steady_clock::time_point last_flush = std::chrono::steady_clock::now();
+
+    void configure(const std::string & output_path) {
+        std::lock_guard<std::mutex> lock(mutex);
+        path = output_path;
+        last_flush = std::chrono::steady_clock::now();
+    }
+
+    bool observe(ggml_tensor * tensor, bool ask) {
+        constexpr char prefix[] = "ffn_moe_topk-";
+        if (std::strncmp(tensor->name, prefix, sizeof(prefix) - 1) != 0) {
+            return false;
+        }
+        if (ask) {
+            return true;
+        }
+
+        char * end = nullptr;
+        const long layer_long = std::strtol(tensor->name + sizeof(prefix) - 1, &end, 10);
+        if (end == tensor->name + sizeof(prefix) - 1 || layer_long < 0 || layer_long > 4095 || tensor->type != GGML_TYPE_I32) {
+            return true;
+        }
+
+        std::vector<uint8_t> data(ggml_nbytes(tensor));
+        ggml_backend_tensor_get(tensor, data.data(), 0, data.size());
+
+        const int layer = static_cast<int>(layer_long);
+        const int64_t n_selected = tensor->ne[0];
+        const int64_t n_token_rows = tensor->ne[1] * tensor->ne[2] * tensor->ne[3];
+        std::lock_guard<std::mutex> lock(mutex);
+        auto & counts = expert_counts[layer];
+        routed_token_rows[layer] += static_cast<uint64_t>(n_token_rows);
+        observed_tensors++;
+        for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
+                for (int64_t i1 = 0; i1 < tensor->ne[1]; ++i1) {
+                    for (int64_t i0 = 0; i0 < n_selected; ++i0) {
+                        const size_t offset = i0 * tensor->nb[0] + i1 * tensor->nb[1] +
+                                              i2 * tensor->nb[2] + i3 * tensor->nb[3];
+                        int32_t expert = -1;
+                        std::memcpy(&expert, data.data() + offset, sizeof(expert));
+                        if (expert < 0 || expert > 4095) {
+                            continue;
+                        }
+                        if (counts.size() <= static_cast<size_t>(expert)) {
+                            counts.resize(static_cast<size_t>(expert) + 1, 0);
+                        }
+                        counts[expert]++;
+                    }
+                }
+            }
+        }
+        if (std::chrono::steady_clock::now() - last_flush >= std::chrono::seconds(30)) {
+            write_snapshot_locked();
+            last_flush = std::chrono::steady_clock::now();
+        }
+        return true;
+    }
+
+    void write_snapshot_locked() const {
+        if (path.empty()) {
+            return;
+        }
+        const std::filesystem::path output(path);
+        std::error_code ec;
+        if (!output.parent_path().empty()) {
+            std::filesystem::create_directories(output.parent_path(), ec);
+            if (ec) {
+                fprintf(stderr, "[moe-routing] cannot create output directory: %s\n", ec.message().c_str());
+                return;
+            }
+        }
+        std::filesystem::path temporary = output;
+        temporary += ".tmp";
+        std::ofstream file(temporary, std::ios::out | std::ios::trunc);
+        if (!file) {
+            fprintf(stderr, "[moe-routing] cannot open output file: %s\n", temporary.c_str());
+            return;
+        }
+        file << "{\n  \"schema\": \"llama.cpp.moe-routing.v1\",\n"
+             << "  \"observed_topk_tensors\": " << observed_tensors << ",\n"
+             << "  \"layers\": [\n";
+        bool first_layer = true;
+        for (const auto & [layer, counts] : expert_counts) {
+            if (!first_layer) {
+                file << ",\n";
+            }
+            first_layer = false;
+            file << "    {\"layer\": " << layer << ", \"routed_token_rows\": "
+                 << routed_token_rows.at(layer) << ", \"expert_selections\": [";
+            for (size_t i = 0; i < counts.size(); ++i) {
+                if (i != 0) {
+                    file << ", ";
+                }
+                file << counts[i];
+            }
+            file << "]}";
+        }
+        file << "\n  ]\n}\n";
+        file.close();
+        if (!file) {
+            fprintf(stderr, "[moe-routing] failed writing output file: %s\n", temporary.c_str());
+            return;
+        }
+        if (std::rename(temporary.c_str(), output.c_str()) != 0) {
+            fprintf(stderr, "[moe-routing] failed to replace output file: %s\n", output.c_str());
+        }
+    }
+
+    ~server_moe_routing_collector() {
+        std::lock_guard<std::mutex> lock(mutex);
+        write_snapshot_locked();
+    }
+};
+
+static bool server_moe_routing_eval_callback(ggml_tensor * tensor, bool ask, void * user_data) {
+    return static_cast<server_moe_routing_collector *>(user_data)->observe(tensor, ask);
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -876,6 +1009,8 @@ private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
 
+    server_moe_routing_collector moe_routing_collector;
+
     common_params params_base;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
@@ -1011,6 +1146,11 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        if (!params_base.moe_routing_log.empty()) {
+            moe_routing_collector.configure(params_base.moe_routing_log);
+            params_base.cb_eval = server_moe_routing_eval_callback;
+            params_base.cb_eval_user_data = &moe_routing_collector;
+        }
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
