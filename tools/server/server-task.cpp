@@ -11,6 +11,13 @@
 #include "server-common.h"
 
 #include <sstream>
+#include <regex>
+
+static std::string clean_qwen3_asr_prefix(std::string text) {
+    static const std::regex prefix(R"(^\s*language\s+[A-Za-z0-9_.-]+\s*<asr_text>)",
+                                   std::regex_constants::icase);
+    return std::regex_replace(text, prefix, "");
+}
 
 //
 // task_params
@@ -716,7 +723,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
 json server_task_result_cmpl_final::to_json_oaicompat_asr() {
     json event = json {
         {"type",  "transcript.text.done"},
-        {"text",  oaicompat_msg.content},
+        {"text",  clean_qwen3_asr_prefix(oaicompat_msg.content)},
         {"usage", json {
             {"type",         "tokens"},
             {"input_tokens",  n_prompt_tokens},
