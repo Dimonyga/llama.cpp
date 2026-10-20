@@ -9211,8 +9211,8 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
 
-    GGML_ASSERT(k->type == v->type);
-    const ggml_type kv_type = k->type;
+    const ggml_to_float_t k_to_float = ggml_get_type_traits(k->type)->to_float;
+    const ggml_to_float_t v_to_float = ggml_get_type_traits(v->type)->to_float;
 
 
     // broadcast factors
@@ -9277,7 +9277,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         // VKQ32:  Q_TILE_SZ * DV (FP32 output accumulator)
         // V32:    KV_TILE_SZ * DV (F32 buffer for V tile)
         // K_f32:  KV_TILE_SZ * DK (F32 buffer for K tile — GEMM path)
-        float * base  = (float *) params->wdata + ith*(Q_TILE_SZ*DK + 2*Q_TILE_SZ*KV_TILE_SZ + Q_TILE_SZ*DV + KV_TILE_SZ*DV + KV_TILE_SZ*DK + CACHE_LINE_SIZE_F32);
+        float * base  = (float *) params->wdata + ith*(Q_TILE_SZ*DK + 2*Q_TILE_SZ*KV_TILE_SZ + Q_TILE_SZ*DV + KV_TILE_SZ*DV + KV_TILE_SZ*DK + DK + CACHE_LINE_SIZE_F32);
 
         void  * Q_q    = base;
         float * KQ     = (float *)((char *)base + Q_TILE_SZ * DK * sizeof(float));
@@ -9285,6 +9285,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         float * VKQ32  = mask32 + Q_TILE_SZ * KV_TILE_SZ;
         float * V32    = VKQ32 + Q_TILE_SZ * DV;
         float * K_f32  = V32 + KV_TILE_SZ * DV;
+        float * K_row  = K_f32 + KV_TILE_SZ * DK;
 
         memset(VKQ32, 0, Q_TILE_SZ * DV * sizeof(float));
         memset(mask32, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(float));
@@ -9340,16 +9341,16 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             // Zero-pad the last tile so the GEMM always operates on KV_TILE_SZ columns
             for (int tk = 0; tk < kv_tile; tk++) {
                 const char * k_data = (const char *)k->data + (ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3;
-                if (kv_type == GGML_TYPE_F16) {
-                    const ggml_fp16_t * k_f16 = (const ggml_fp16_t *)k_data;
-                    for (int64_t dk = 0; dk < DK; dk++) {
-                        K_f32[dk * KV_TILE_SZ + tk] = GGML_CPU_FP16_TO_FP32(k_f16[dk]);
-                    }
-                } else {
-                    const float * k_f32_src = (const float *)k_data;
-                    for (int64_t dk = 0; dk < DK; dk++) {
-                        K_f32[dk * KV_TILE_SZ + tk] = k_f32_src[dk];
-                    }
+                const float * k_f32_src = (const float *) k_data;
+                if (k->type == GGML_TYPE_F16) {
+                    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) k_data, K_row, DK);
+                    k_f32_src = K_row;
+                } else if (k->type != GGML_TYPE_F32) {
+                    k_to_float(k_data, K_row, DK);
+                    k_f32_src = K_row;
+                }
+                for (int64_t dk = 0; dk < DK; dk++) {
+                    K_f32[dk * KV_TILE_SZ + tk] = k_f32_src[dk];
                 }
             }
             memset(KQ, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(float));
@@ -9405,10 +9406,12 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             // Pack V tile to contiguous F32, zero-padded
             for (int tk = 0; tk < kv_tile; tk++) {
                 const char * v_data = (const char *)v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
-                if (kv_type == GGML_TYPE_F16) {
-                    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
-                } else {
+                if (v->type == GGML_TYPE_F32) {
                     memcpy(V32 + tk * DV, v_data, DV * sizeof(float));
+                } else if (v->type == GGML_TYPE_F16) {
+                    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) v_data, V32 + tk * DV, DV);
+                } else {
+                    v_to_float(v_data, V32 + tk * DV, DV);
                 }
             }
             for (int tq = 0; tq < Q_TILE_SZ; tq++) {
@@ -9577,6 +9580,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
+    const auto tiled_type_supported = [](ggml_type type) {
+        return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0;
+    };
     const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
@@ -9636,8 +9642,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
         bool use_tiled = !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
-                                kv_is_f32_or_f16 &&
-                                k->type == v->type &&
+                                tiled_type_supported(k->type) &&
+                                tiled_type_supported(v->type) &&
                                 neq1 >= Q_TILE_SZ);
 #if defined(GGML_SIMD) && !defined(__x86_64__) && !defined(_M_X64)
 #if defined(__ARM_FEATURE_SVE)

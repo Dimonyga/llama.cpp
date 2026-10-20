@@ -1,6 +1,10 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A && __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
+#define GGML_CUDA_FATTN_TILE_FP32_HALF_KV
+#endif
+
 // nbatch_fa == number of KQ rows to process per iteration
 // nbatch_K == number of K columns to load in parallel for KQ calculation
 
@@ -481,11 +485,11 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
 
 // Function that performs a single iteration in for the KQ matrix multiplication:
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int nbatch_fa, int nbatch_K,
-    bool use_logit_softcap, bool oob_check, typename T_vec_dot>
+    bool use_logit_softcap, bool oob_check, typename T_vec_dot, typename T_KV>
 static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
         T_vec_dot   * const Q_tmp,
         const half2 * const __restrict__ K_h2,
-        T_vec_dot   * const KV_tmp,
+        T_KV        * const KV_tmp,
         const int stride_K2,
         const int k_VKQ_0,
         const int k_VKQ_sup,
@@ -523,7 +527,18 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
 #ifdef FAST_FP16_AVAILABLE
             ggml_cuda_memcpy_1<cpy_nb>(&K_k[i_KQ_0/(np*warp_size)], &KV_tmp[i_KQ*(nbatch_K/2 + cpy_ne) + k_KQ_1]);
 #else
+#ifdef GGML_CUDA_FATTN_TILE_FP32_HALF_KV
+            __align__(16) half2 K_half[cpy_ne/2];
+            ggml_cuda_memcpy_1<sizeof(K_half)>(K_half, &KV_tmp[i_KQ*(nbatch_K/2 + cpy_ne) + k_KQ_1/2]);
+#pragma unroll
+            for (int item = 0; item < cpy_ne/2; ++item) {
+                const float2 value = __half22float2(K_half[item]);
+                K_k[i_KQ_0/(np*warp_size)][2*item + 0] = value.x;
+                K_k[i_KQ_0/(np*warp_size)][2*item + 1] = value.y;
+            }
+#else
             ggml_cuda_memcpy_1<cpy_nb>(&K_k[i_KQ_0/(np*warp_size)], &KV_tmp[i_KQ*(nbatch_K   + cpy_ne) + k_KQ_1]);
+#endif
 #endif // FAST_FP16_AVAILABLE
         }
 #pragma unroll
@@ -556,7 +571,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
 
 // Function that performs a single iteration of the main loop over up to nbatch_fa tokens.
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
-    bool use_logit_softcap, bool oob_check, typename T_vec_dot, typename T_KQ, typename T_acc>
+    bool use_logit_softcap, bool oob_check, typename T_vec_dot, typename T_KQ, typename T_acc, typename T_KV>
 static __device__ __forceinline__ void flash_attn_tile_iter(
         T_vec_dot * const Q_tmp,
         const half2 * const __restrict__ K_h2,
@@ -566,7 +581,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         const float logit_softcap,
         const float slope,
         T_KQ      * const KQ,
-        T_vec_dot * const KV_tmp,
+        T_KV      * const KV_tmp,
         const int stride_K2,
         const int stride_V2,
         const int stride_mask,
@@ -763,7 +778,16 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             constexpr int cpy_ne_D = cpy_ne < DVp/warp_size ? cpy_ne : DVp/warp_size;
 #pragma unroll
             for (int i0 = 0; i0 < DVp; i0 += warp_size*cpy_ne_D) {
+#ifdef GGML_CUDA_FATTN_TILE_FP32_HALF_KV
+                __align__(16) half2 V_half[cpy_ne_D/2];
+                ggml_cuda_memcpy_1<sizeof(V_half)>(V_half, &KV_tmp[(k1 + threadIdx.y % np)*(DV/2) + (i0 + threadIdx.x*cpy_ne_D)/2]);
+#pragma unroll
+                for (int item = 0; item < cpy_ne_D/2; ++item) {
+                    V_k[i0/(2*warp_size) + item] = __half22float2(V_half[item]);
+                }
+#else
                 ggml_cuda_memcpy_1<cpy_ne_D*4>(&V_k[i0/(2*warp_size)], &KV_tmp[(k1 + threadIdx.y % np)*DV + i0 + threadIdx.x*cpy_ne_D]);
+#endif
             }
 #pragma unroll
             for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; jc_VKQ_0 += KQ_cs) {
@@ -888,7 +912,11 @@ static __global__ void flash_attn_tile(
     __align__(16) half2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
 #else
     __shared__ float Q_tmp[ncols * DKQ];
+#ifdef GGML_CUDA_FATTN_TILE_FP32_HALF_KV
+    __shared__ half2 KV_tmp[nbatch_fa * (nbatch_K/2 + cpy_ne) + DVp-DV];
+#else
     __shared__ float KV_tmp[nbatch_fa * (nbatch_K + cpy_ne) + DVp-DV];
+#endif
     __shared__ float KQ[ncols * nbatch_fa];
     __align__(16) float2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
 #endif // FAST_FP16_AVAILABLE
@@ -1353,3 +1381,5 @@ extern DECL_FATTN_TILE_CASE(256, 256);
 extern DECL_FATTN_TILE_CASE(320, 256);
 extern DECL_FATTN_TILE_CASE(512, 512);
 extern DECL_FATTN_TILE_CASE(576, 512);
+
+#undef GGML_CUDA_FATTN_TILE_FP32_HALF_KV

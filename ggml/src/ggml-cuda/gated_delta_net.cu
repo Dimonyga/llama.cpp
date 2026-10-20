@@ -44,6 +44,13 @@ gated_delta_net_cuda(const float * q,
     constexpr int rows_per_lane = S_v / lanes_per_col;
     static_assert(S_v % lanes_per_col == 0, "S_v must be a multiple of lanes_per_col");
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A && __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
+    constexpr bool share_qk = !KDA && S_v == 128;
+#else
+    constexpr bool share_qk = false;
+#endif
+    __shared__ float qk_shared[share_qk ? 2*S_v : 1];
+
     const int lane        = threadIdx.x;
     const int col_in_warp = lane / lanes_per_col;              // column slot within the warp
     const int lane_in_col = lane - col_in_warp * lanes_per_col;  // lane within the column's reduction segment
@@ -83,14 +90,22 @@ gated_delta_net_cuda(const float * q,
 
         const float beta_val = *beta_t;
 
-        // Cache k and q in registers
-        float k_reg[rows_per_lane];
-        float q_reg[rows_per_lane];
+        float k_reg[share_qk ? 1 : rows_per_lane];
+        float q_reg[share_qk ? 1 : rows_per_lane];
+        if constexpr (share_qk) {
+            const int tid = threadIdx.y*warp_size + lane;
+            for (int index = tid; index < S_v; index += blockDim.y*warp_size) {
+                qk_shared[index]       = q_t[index];
+                qk_shared[S_v + index] = k_t[index];
+            }
+            __syncthreads();
+        } else {
 #pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            const int i = r * lanes_per_col + lane_in_col;
-            k_reg[r] = k_t[i];
-            q_reg[r] = q_t[i];
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i = r * lanes_per_col + lane_in_col;
+                k_reg[r] = k_t[i];
+                q_reg[r] = q_t[i];
+            }
         }
 
         if constexpr (!KDA) {
@@ -98,9 +113,14 @@ gated_delta_net_cuda(const float * q,
 
             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
             float kv_shard = 0.0f;
+            float attn_partial = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                kv_shard += s_shard[r] * k_reg[r];
+                const int index = r*lanes_per_col + lane_in_col;
+                kv_shard += s_shard[r] * (share_qk ? qk_shared[S_v + index] : k_reg[r]);
+                if constexpr (share_qk) {
+                    attn_partial += s_shard[r] * qk_shared[index];
+                }
             }
             float kv_col = warp_reduce_sum<lanes_per_col>(kv_shard);
 
@@ -109,14 +129,25 @@ gated_delta_net_cuda(const float * q,
 
             // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
             // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
-            float attn_partial = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
-                attn_partial += s_shard[r] * q_reg[r];
+                const int index = r*lanes_per_col + lane_in_col;
+                s_shard[r] = g_val * s_shard[r] + (share_qk ? qk_shared[S_v + index] : k_reg[r]) * delta_col;
+                if constexpr (!share_qk) {
+                    attn_partial += s_shard[r] * q_reg[r];
+                }
             }
 
             float attn_col = warp_reduce_sum<lanes_per_col>(attn_partial);
+            if constexpr (share_qk) {
+                float kq_partial = 0.0f;
+#pragma unroll
+                for (int index = lane; index < S_v; index += warp_size) {
+                    kq_partial += qk_shared[index] * qk_shared[S_v + index];
+                }
+                const float kq = warp_reduce_sum<warp_size>(kq_partial);
+                attn_col = g_val * attn_col + delta_col * kq;
+            }
 
             if (lane_in_col == 0) {
                 attn_data[col] = attn_col * scale;
@@ -149,6 +180,12 @@ gated_delta_net_cuda(const float * q,
 
             if (lane_in_col == 0) {
                 attn_data[col] = attn_col * scale;
+            }
+        }
+
+        if constexpr (share_qk) {
+            if (t + 1 < n_tokens) {
+                __syncthreads();
             }
         }
 

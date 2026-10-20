@@ -11814,6 +11814,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (ggml_type type_K : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (ggml_type type_V : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+            for (int64_t nb : {64, 65}) {
+                for (bool mask : {false, true}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 128, 2, {2, 2}, 113, nb, mask, true, mask ? 8.0f : 0.0f, 1.0f, GGML_PREC_F32, type_K, type_V, {0, 2, 1, 3}));
+                }
+            }
+        }
+    }
+
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -12073,6 +12083,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+    for (int64_t n_tokens : {1, 8, 65}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 3, true));
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 8, 2, 3, true, false, 4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
@@ -12415,6 +12429,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 }
                 test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32, {IW_IH, IW_IH, IC, 1}, {K, K, IC, 1}, 1, 1, 1, 1, 1, 1, true));
             }
+        }
+    }
+
+    for (ggml_type type_KV : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int64_t hs : {128, 256}) {
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {4, 1}, 1024, 64, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
         }
     }
 
