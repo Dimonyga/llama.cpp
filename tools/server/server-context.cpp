@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-tensor-stats.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-decision.h"
@@ -168,8 +169,28 @@ struct server_moe_routing_collector {
     }
 };
 
-static bool server_moe_routing_eval_callback(ggml_tensor * tensor, bool ask, void * user_data) {
-    return static_cast<server_moe_routing_collector *>(user_data)->observe(tensor, ask);
+// ggml has one eval-callback slot; the opt-in collectors share it.
+struct server_eval_observers {
+    server_moe_routing_collector * moe   = nullptr;
+    server_tensor_stats *          stats = nullptr;
+};
+
+static bool server_eval_callback(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto * observers = static_cast<server_eval_observers *>(user_data);
+    bool wanted = false;
+    if (observers->moe != nullptr && observers->moe->observe(tensor, true)) {
+        wanted = true;
+        if (!ask) {
+            observers->moe->observe(tensor, false);
+        }
+    }
+    if (observers->stats != nullptr && observers->stats->observe(tensor, true)) {
+        wanted = true;
+        if (!ask) {
+            observers->stats->observe(tensor, false);
+        }
+    }
+    return wanted;
 }
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -1120,6 +1141,8 @@ private:
     // use server_context methods instead
 
     server_moe_routing_collector moe_routing_collector;
+    server_tensor_stats tensor_stats;
+    server_eval_observers eval_observers;
 
     common_params params_base;
 
@@ -1258,8 +1281,15 @@ private:
         params_base = params;
         if (!params_base.moe_routing_log.empty()) {
             moe_routing_collector.configure(params_base.moe_routing_log);
-            params_base.cb_eval = server_moe_routing_eval_callback;
-            params_base.cb_eval_user_data = &moe_routing_collector;
+            eval_observers.moe = &moe_routing_collector;
+        }
+        if (!params_base.tensor_stats_file.empty()) {
+            tensor_stats.configure(params_base.tensor_stats_file, params_base.tensor_stats_min_rows);
+            eval_observers.stats = &tensor_stats;
+        }
+        if (eval_observers.moe != nullptr || eval_observers.stats != nullptr) {
+            params_base.cb_eval = server_eval_callback;
+            params_base.cb_eval_user_data = &eval_observers;
         }
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;

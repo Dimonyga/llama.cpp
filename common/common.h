@@ -523,6 +523,8 @@ struct common_params {
     std::string logits_file          = ""; // file for saving *all* logits                                  // NOLINT
     std::string path_prompts_log_dir = ""; // directory with logged prompts                                 // NOLINT
     std::string moe_routing_log      = ""; // optional path for per-layer MoE expert-selection counts
+    std::string tensor_stats_file    = ""; // optional path of a live imatrix (activation statistics) written by the server
+    int32_t     tensor_stats_min_rows = 16; // observe only batches with at least this many rows (skips decode steps)
 
     // llama-debug specific options
     std::string logits_output_dir = "data"; // directory for saving logits output files                     // NOLINT

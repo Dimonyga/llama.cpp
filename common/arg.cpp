@@ -3952,6 +3952,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--tensor-stats"}, "PATH",
+        "collect activation statistics of the traffic served and keep them as a GGUF imatrix at PATH "
+        "(feeds llama-quantize --imatrix; accumulates across restarts; adds synchronization overhead on large batches)",
+        [](common_params & params, const std::string & value) {
+            params.tensor_stats_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--tensor-stats-min-rows"}, "N",
+        string_format("observe only batches of at least N rows for --tensor-stats (default: %d)", params.tensor_stats_min_rows),
+        [](common_params & params, int value) {
+            params.tensor_stats_min_rows = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--log-colors"}, "[on|off|auto]",
         "Set colored logging ('on', 'off', or 'auto', default: 'auto')\n"
         "'auto' enables colors when output is to a terminal",
