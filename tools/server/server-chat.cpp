@@ -648,11 +648,29 @@ json server_chat_msg_diff_to_json_oaicompat(const common_chat_msg_diff & diff) {
     return delta;
 }
 
+static std::string audio_language_name(const std::string & language) {
+    if (language == "ru") return "Russian";
+    if (language == "en") return "English";
+    if (language == "uk") return "Ukrainian";
+    if (language == "de") return "German";
+    if (language == "fr") return "French";
+    if (language == "es") return "Spanish";
+    if (language == "it") return "Italian";
+    if (language == "pt") return "Portuguese";
+    if (language == "pl") return "Polish";
+    if (language == "lt") return "Lithuanian";
+    if (language == "zh") return "Chinese";
+    if (language == "ja") return "Japanese";
+    if (language == "ko") return "Korean";
+    return language;
+}
+
 json convert_transcriptions_to_chatcmpl(
         const json & inp_body,
         const common_chat_templates * tmpls,
         const std::map<std::string, uploaded_file> & in_files,
-        std::vector<raw_buffer> & out_files) {
+        std::vector<raw_buffer> & out_files,
+        bool translate) {
     // TODO @ngxson : this function may need to be improved in the future
     // handle input files
     out_files.clear();
@@ -667,15 +685,42 @@ json convert_transcriptions_to_chatcmpl(
     std::string prompt          = json_value(inp_body, "prompt", std::string());
     std::string language        = json_value(inp_body, "language", std::string());
     std::string response_format = json_value(inp_body, "response_format", std::string("json"));
-    if (response_format != "json") {
-        throw std::invalid_argument("Only 'json' response_format is supported for transcription");
+    if (response_format != "json" && response_format != "text" && response_format != "verbose_json" &&
+        response_format != "srt" && response_format != "vtt") {
+        throw std::invalid_argument("Unsupported 'response_format'; use json, text, verbose_json, srt or vtt");
     }
     const common_chat_prompt_preset preset = common_chat_get_asr_prompt(tmpls);
-    if (prompt.empty()) {
-        prompt = preset.user;
-    }
-    if (!language.empty()) {
-        prompt += string_format(" (language: %s)", language.c_str());
+    const std::string template_source = tmpls ? common_chat_templates_source(tmpls, "") : "";
+    const bool is_gemma4 = template_source.find("Google Gemma 4 Canonical Chat Template") != std::string::npos ||
+        (template_source.find("<|turn>") != std::string::npos && template_source.find("<turn|>") != std::string::npos &&
+         template_source.find("<|channel>") != std::string::npos);
+    if (is_gemma4) {
+        const std::string context = std::move(prompt);
+        const std::string source_language = language.empty() ? "its original language" : audio_language_name(language);
+        if (translate) {
+            const std::string target_language = audio_language_name(json_value(inp_body, "target_language", std::string("English")));
+            prompt = string_format(
+                "Transcribe the following speech segment in %s, then translate it into %s.\n"
+                "When formatting the answer, first output the transcription in %s, then one newline, then output the string '%s: ', then the translation in %s.",
+                source_language.c_str(), target_language.c_str(), source_language.c_str(), target_language.c_str(), target_language.c_str());
+        } else {
+            prompt = string_format(
+                "Transcribe the following speech segment in %s into %s text.\n\n"
+                "Follow these specific instructions for formatting the answer:\n"
+                "* Only output the transcription, with no newlines.\n"
+                "* When transcribing numbers, write the digits, i.e. write 1.7 and not one point seven, and write 3 instead of three.",
+                source_language.c_str(), source_language.c_str());
+        }
+        if (!context.empty()) {
+            prompt += "\nUse the following context to resolve names and ambiguous words: " + context;
+        }
+    } else {
+        if (prompt.empty()) {
+            prompt = preset.user;
+        }
+        if (!language.empty()) {
+            prompt += string_format(" (language: %s)", language.c_str());
+        }
     }
     prompt += get_media_marker();
 
@@ -687,6 +732,10 @@ json convert_transcriptions_to_chatcmpl(
 
     json chatcmpl_body = inp_body; // copy all fields
     chatcmpl_body["messages"] = messages;
+    if (is_gemma4) {
+        chatcmpl_body["chat_template_kwargs"] = json::object();
+        chatcmpl_body["chat_template_kwargs"]["enable_thinking"] = false;
+    }
 
     // because input from form-data, everything is string, we need to correct the types here
     std::string stream = json_value(inp_body, "stream", std::string("false"));

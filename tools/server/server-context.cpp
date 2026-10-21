@@ -22,6 +22,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cmath>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -2987,6 +2991,118 @@ private:
         return n_read;
     }
 
+    bool process_tts_task(server_task & task) {
+        if (mctx == nullptr || mtmd_gen_audio_get_info(mctx).type == MTMD_GEN_AUDIO_TYPE_NONE) {
+            send_error(task, "The current model does not support audio generation.", ERROR_TYPE_NOT_SUPPORTED);
+            return true;
+        }
+
+        server_slot * slot = task.id_slot == -1 ? nullptr : get_slot_by_id(task.id_slot);
+        if (task.id_slot != -1 && slot == nullptr) {
+            send_error(task, "Invalid TTS slot id.", ERROR_TYPE_INVALID_REQUEST);
+            return true;
+        }
+        if (slot == nullptr && task.id_slot == -1) {
+            auto free_slots = get_free_slots(1, -1);
+            slot = free_slots.empty() ? nullptr : free_slots[0];
+        }
+        if (slot == nullptr || slot->is_processing()) {
+            return false;
+        }
+
+        slot->prompt_clear();
+
+        mtmd::bitmap_ptr speaker_bitmap;
+        if (!params_base.tts_speaker_file.empty()) {
+            auto wrapper = mtmd_helper_bitmap_init_from_file(mctx, params_base.tts_speaker_file.c_str(), false, init_opt);
+            if (!wrapper.bitmap) {
+                send_error(task, "Failed to load the configured TTS speaker file.");
+                return true;
+            }
+            speaker_bitmap.reset(wrapper.bitmap);
+        }
+
+        common_sampler_ptr smpl;
+        try {
+            smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+        } catch (const std::exception & e) {
+            send_error(task, std::string("Failed to initialize the TTS sampler: ") + e.what());
+            return true;
+        }
+
+        mtmd_helper::gen_audio gen(slot->ctx_tgt, mctx);
+        mtmd_helper_gen_audio_inp inp{};
+        inp.seq_id      = slot->id;
+        inp.prompt      = task.tts.prompt.c_str();
+        inp.prompt_len  = task.tts.prompt.size();
+        inp.speaker_ref = speaker_bitmap.get();
+        inp.lang        = task.tts.language.empty() ? nullptr : task.tts.language.c_str();
+        inp.top_k       = task.params.sampling.top_k;
+        inp.top_p       = task.params.sampling.top_p;
+        inp.seed        = task.params.sampling.seed;
+        inp.out_type    = task.tts.response_format == "pcm" ? MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM : MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
+
+        if (gen.set_input(&inp) != 0) {
+            slot->prompt_clear();
+            send_error(task, "Failed to initialize TTS generation.");
+            return true;
+        }
+
+        for (;;) {
+            const int32_t ret = gen.step_prompt(params_base.n_batch);
+            if (ret < 0) {
+                slot->prompt_clear();
+                send_error(task, "Failed to process the TTS prompt.");
+                return true;
+            }
+            if (ret == 0) {
+                break;
+            }
+        }
+
+        auto sample = [&]() {
+            const llama_token token = common_sampler_sample(smpl.get(), slot->ctx_tgt, -1);
+            common_sampler_accept(smpl.get(), token, true);
+            return token;
+        };
+
+        llama_token sampled = sample();
+        const float * h_state = llama_get_embeddings_ith(slot->ctx_tgt, -1);
+        bool stop = false;
+        int32_t n_frames = 0;
+        while (!stop && n_frames < task.tts.max_frames) {
+            const float * h_next = nullptr;
+            if (gen.step_gen(sampled, h_state, &h_next, &stop) != 0) {
+                slot->prompt_clear();
+                send_error(task, "TTS generation failed.");
+                return true;
+            }
+            if (h_next == nullptr) {
+                break;
+            }
+            h_state = h_next;
+            sampled = sample();
+            n_frames++;
+        }
+
+        int32_t sample_rate = 0;
+        const char * data = nullptr;
+        size_t data_len = 0;
+        if (gen.get_output(&sample_rate, &data, &data_len) != 0) {
+            slot->prompt_clear();
+            send_error(task, "Failed to render TTS audio.");
+            return true;
+        }
+
+        auto res = std::make_unique<server_task_result_tts>();
+        res->id = task.id;
+        res->data.assign(data, data_len);
+        res->content_type = task.tts.response_format == "pcm" ? "application/octet-stream" : "audio/wav";
+        queue_results.send(std::move(res));
+        slot->prompt_clear();
+        return true;
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -3068,6 +3184,11 @@ private:
                         }
                     }
                 } break;
+            case SERVER_TASK_TYPE_TTS:
+                if (!process_tts_task(task)) {
+                    queue_tasks.defer(std::move(task));
+                }
+                break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
                     // release slot linked with the task id
@@ -4983,6 +5104,11 @@ server_context_meta server_context::get_meta() const {
     auto eos_token_str = eos_id != LLAMA_TOKEN_NULL ? common_token_to_piece(impl->ctx_tgt, eos_id, true) : "";
 
     const char * ftype_name = llama_ftype_name(llama_model_ftype(impl->model_tgt));
+    auto output_modalities = server_model_output_modalities(common_get_decision_type(impl->model_tgt));
+    const bool has_gen_audio = impl->mctx != nullptr && mtmd_gen_audio_get_info(impl->mctx).type != MTMD_GEN_AUDIO_TYPE_NONE;
+    if (has_gen_audio && std::find(output_modalities.begin(), output_modalities.end(), "audio") == output_modalities.end()) {
+        output_modalities.push_back("audio");
+    }
 
     return server_context_meta {
         /* build_info              */ std::string(llama_build_info()),
@@ -4990,11 +5116,12 @@ server_context_meta server_context::get_meta() const {
         /* model_aliases           */ impl->model_aliases,
         /* model_tags              */ impl->model_tags,
         /* model_path              */ impl->params_base.model.path,
-        /* model_output_modalities */ server_model_output_modalities(common_get_decision_type(impl->model_tgt)),
+        /* model_output_modalities */ std::move(output_modalities),
         /* has_mtmd                */ impl->mctx != nullptr,
         /* has_inp_image           */ impl->chat_params.allow_image,
         /* has_inp_audio           */ impl->chat_params.allow_audio,
         /* has_inp_video           */ impl->chat_params.allow_video,
+        /* has_gen_audio           */ has_gen_audio,
         /* json_ui_settings        */ impl->json_ui_settings,
         /* slot_n_ctx              */ impl->n_ctx_slot(),
         /* pooling_type            */ llama_pooling_type(impl->ctx_tgt),
@@ -5451,6 +5578,40 @@ json server_routes::get_model_info() const {
     return get_res_model_info(*meta);
 }
 
+// miniaudio decodes wav/mp3/flac only; other containers (ogg, opus, webm, m4a, ...) are converted with ffmpeg when available
+static bool audio_convert_if_needed(raw_buffer & data, std::string & err) {
+    auto has = [&](size_t off, const char * m) { return data.size() >= off + strlen(m) && memcmp(data.data() + off, m, strlen(m)) == 0; };
+    const bool native = has(0, "RIFF") || has(0, "ID3") || has(0, "fLaC") ||
+        (data.size() > 2 && data[0] == 0xFF && (data[1] & 0xE0) == 0xE0);
+    if (native) {
+        return true;
+    }
+#ifdef _WIN32
+    err = "Unsupported audio container; use wav, mp3 or flac";
+    return false;
+#else
+    const std::string base = (std::filesystem::temp_directory_path() / "llama-asr-").string() + std::to_string(ggml_time_us()) + "-" + std::to_string((uintptr_t) &data);
+    const std::string in_path = base + ".in", out_path = base + ".wav";
+    {
+        std::ofstream f(in_path, std::ios::binary);
+        f.write((const char *) data.data(), data.size());
+    }
+    const std::string cmd = "ffmpeg -nostdin -loglevel error -y -i '" + in_path + "' -vn -ar 16000 -ac 1 -f wav '" + out_path + "' 2>/dev/null";
+    const int rc = system(cmd.c_str());
+    std::remove(in_path.c_str());
+    std::ifstream f(out_path, std::ios::binary);
+    if (rc != 0 || !f) {
+        std::remove(out_path.c_str());
+        err = "Unsupported audio format and ffmpeg conversion failed; use wav, mp3 or flac";
+        return false;
+    }
+    data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    f.close();
+    std::remove(out_path.c_str());
+    return true;
+#endif
+}
+
 void server_routes::init_routes() {
     // IMPORTANT: all lambda functions must start with create_response()
     // this is to ensure that the server_res_generator can handle sleeping case correctly
@@ -5818,7 +5979,7 @@ void server_routes::init_routes() {
         return handle_count_tokens(req, TASK_RESPONSE_TYPE_OAI_RESP);
     };
 
-    this->post_transcriptions_oai = [this](const server_http_req & req) {
+    auto post_audio_text = [this](const server_http_req & req, bool translate) {
         auto res = create_response();
 
         if (!meta->has_mtmd || !meta->chat_params.allow_audio) {
@@ -5827,12 +5988,21 @@ void server_routes::init_routes() {
         }
 
         std::vector<raw_buffer> files;
+        std::map<std::string, uploaded_file> in_files = req.files;
+        if (auto it = in_files.find("file"); it != in_files.end()) {
+            std::string err;
+            if (!audio_convert_if_needed(it->second.data, err)) {
+                res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
         json body = convert_transcriptions_to_chatcmpl(
             json::parse(req.body),
             meta->chat_params.tmpls.get(),
-            req.files,
-            files);
-        SRV_DBG("%s\n", "Request converted: OpenAI Transcriptions -> OpenAI Chat Completions");
+            in_files,
+            files,
+            translate);
+        SRV_DBG("Request converted: OpenAI audio %s -> OpenAI Chat Completions\n", translate ? "translation" : "transcription");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
         common_chat_session session;
         json body_parsed = oaicompat_chat_params_parse(
@@ -5841,13 +6011,142 @@ void server_routes::init_routes() {
             meta->chat_params,
             files,
             session);
-        return handle_completions_impl(
+        auto out = handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
             TASK_RESPONSE_TYPE_OAI_ASR,
             session);
+        const std::string fmt = json_value(body, "response_format", std::string("json"));
+        if ((fmt != "json" || translate) && out && !out->is_stream() && out->status == 200) {
+            try {
+                json j = json::parse(out->data);
+                std::string text = j.value("text", "");
+                if (translate) {
+                    // Gemma 4 emits "<transcript>\n<Target>: <translation>"; keep only the translation
+                    const std::string target = json_value(json::parse(req.body), "target_language", std::string("English"));
+                    const std::string name = target == "ru" ? "Russian" : target == "en" ? "English" : target;
+                    const size_t pos = text.find("\n" + name + ": ");
+                    if (pos != std::string::npos) {
+                        text = text.substr(pos + name.size() + 3);
+                    }
+                }
+                while (!text.empty() && std::isspace((unsigned char) text.back())) text.pop_back();
+                // duration is only known for PCM WAV uploads
+                double duration = 0.0;
+                auto it = in_files.find("file");
+                if (it != in_files.end()) {
+                    const auto & d = it->second.data;
+                    if (d.size() > 44 && memcmp(d.data(), "RIFF", 4) == 0 && memcmp(d.data() + 8, "WAVE", 4) == 0) {
+                        uint32_t byte_rate; memcpy(&byte_rate, d.data() + 28, 4);
+                        if (byte_rate > 0) duration = (double) (d.size() - 44) / byte_rate;
+                    }
+                }
+                auto ts = [&](double t, char sep) {
+                    int ms = (int) std::lround(t * 1000.0);
+                    return string_format("%02d:%02d:%02d%c%03d", ms / 3600000, ms / 60000 % 60, ms / 1000 % 60, sep, ms % 1000);
+                };
+                if (fmt == "text") {
+                    out->content_type = "text/plain; charset=utf-8";
+                    out->data = text + "\n";
+                } else if (fmt == "srt") {
+                    out->content_type = "text/plain; charset=utf-8";
+                    out->data = "1\n" + ts(0, ',') + " --> " + ts(duration, ',') + "\n" + text + "\n";
+                } else if (fmt == "vtt") {
+                    out->content_type = "text/vtt; charset=utf-8";
+                    out->data = "WEBVTT\n\n" + ts(0, '.') + " --> " + ts(duration, '.') + "\n" + text + "\n";
+                } else if (fmt == "verbose_json") {
+                    json b = json::parse(req.body);
+                    out->data = json {
+                        {"task",     translate ? "translate" : "transcribe"},
+                        {"language", json_value(b, "language", std::string())},
+                        {"duration", duration},
+                        {"text",     text},
+                        {"segments", json::array({ json {
+                            {"id", 0}, {"seek", 0}, {"start", 0.0}, {"end", duration}, {"text", text},
+                            {"tokens", json::array()}, {"temperature", 0.0}, {"avg_logprob", 0.0},
+                            {"compression_ratio", 0.0}, {"no_speech_prob", 0.0},
+                        } })},
+                        {"usage", j.value("usage", json::object())},
+                    }.dump();
+                } else {
+                    j["text"] = text;
+                    out->data = j.dump();
+                }
+            } catch (const std::exception & e) {
+                SRV_WRN("audio response post-processing failed: %s\n", e.what());
+            }
+        }
+        return out;
+    };
+
+    this->post_transcriptions_oai = [post_audio_text](const server_http_req & req) {
+        return post_audio_text(req, false);
+    };
+
+    this->post_translations_oai = [post_audio_text](const server_http_req & req) {
+        return post_audio_text(req, true);
+    };
+
+    this->post_speech_oai = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        if (!meta->has_gen_audio) {
+            res->error(format_error_response("The current model does not support audio generation.", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        try {
+            const json body = json::parse(req.body);
+            const std::string input = body.at("input").get<std::string>();
+            if (input.empty()) {
+                throw std::invalid_argument("Field 'input' must not be empty");
+            }
+
+            const std::string format = json_value(body, "response_format", std::string("wav"));
+            if (format != "wav" && format != "pcm") {
+                throw std::invalid_argument("Field 'response_format' must be 'wav' or 'pcm'");
+            }
+
+            const float speed = json_value(body, "speed", 1.0f);
+            if (speed != 1.0f) {
+                throw std::invalid_argument("Field 'speed' currently supports only 1.0");
+            }
+
+            server_task task(SERVER_TASK_TYPE_TTS);
+            task.id = res->rd.get_new_id();
+            task.id_slot = json_value(body, "id_slot", -1);
+            task.params = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog, body);
+            task.tts.prompt = input;
+            task.tts.language = json_value(body, "language", params.tts_lang);
+            task.tts.response_format = format;
+            task.tts.max_frames = json_value(body, "max_frames", task.params.n_predict > 0 ? task.params.n_predict : 512);
+            if (task.tts.max_frames < 1) {
+                throw std::invalid_argument("Field 'max_frames' must be positive");
+            }
+
+            res->rd.post_task(std::move(task));
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto result = res->rd.next(req.should_stop);
+        if (result == nullptr) {
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        auto * audio = dynamic_cast<server_task_result_tts *>(result.get());
+        GGML_ASSERT(audio != nullptr);
+        res->status = 200;
+        res->content_type = audio->content_type;
+        res->data = std::move(audio->data);
+        return res;
     };
 
     this->post_anthropic_messages = [this](const server_http_req & req) {

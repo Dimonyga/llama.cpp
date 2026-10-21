@@ -24,6 +24,7 @@ struct server_context_meta {
     bool has_inp_image;
     bool has_inp_audio;
     bool has_inp_video;
+    bool has_gen_audio;
     json json_ui_settings;
     int slot_n_ctx;
     enum llama_pooling_type pooling_type;
@@ -144,6 +145,8 @@ struct server_routes {
     server_http_context::handler_t post_responses_oai;
     server_http_context::handler_t post_responses_tok_oai;
     server_http_context::handler_t post_transcriptions_oai;
+    server_http_context::handler_t post_translations_oai;
+    server_http_context::handler_t post_speech_oai;
     server_http_context::handler_t post_anthropic_messages;
     server_http_context::handler_t post_anthropic_count_tokens;
     server_http_context::handler_t post_apply_template;

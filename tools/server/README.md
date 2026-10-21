@@ -344,10 +344,13 @@ services:
 Multimodal support was added in [#12898](https://github.com/ggml-org/llama.cpp/pull/12898) and is currently an experimental feature.
 It is currently available in the following endpoints:
 - The OAI-compatible chat endpoint.
+- The OAI-compatible `/v1/audio/transcriptions` and `/v1/audio/translations` endpoints for models with audio input.
 - The non-OAI-compatible completions endpoint.
 - The non-OAI-compatible embeddings endpoint.
 
 For more details, please refer to [multimodal documentation](../../docs/multimodal.md)
+
+The transcription endpoint accepts the OpenAI multipart audio format. For Gemma 4, the server supplies the model-specific ASR prompt and uses the optional `prompt` field as recognition context. The translation endpoint accepts the same fields and adds `target_language`, which defaults to `English` as in the OpenAI API. `response_format` accepts json, text, verbose_json, srt and vtt; srt, vtt and verbose_json carry a single segment spanning the clip (duration is known for WAV input only). `/v1/audio/speech` is the TTS endpoint for models with audio generation support.
 
 ### Server tools support
 

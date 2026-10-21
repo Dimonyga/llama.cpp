@@ -17,6 +17,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_EMBEDDING,
     SERVER_TASK_TYPE_RERANK,
     SERVER_TASK_TYPE_DECISION,
+    SERVER_TASK_TYPE_TTS,
     SERVER_TASK_TYPE_INFILL,
     SERVER_TASK_TYPE_CANCEL,
     SERVER_TASK_TYPE_CONTROL,
@@ -155,6 +156,14 @@ struct server_task {
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
     server_tokens tokens;
+
+    struct tts_input {
+        std::string prompt;
+        std::string language;
+        std::string response_format = "wav";
+        int32_t max_frames = 512;
+    };
+    tts_input tts;
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
@@ -543,6 +552,13 @@ struct server_task_result_error : server_task_result {
     }
 
     virtual json to_json() override;
+};
+
+struct server_task_result_tts : server_task_result {
+    std::string data;
+    std::string content_type;
+
+    virtual json to_json() override { return nullptr; }
 };
 
 // used by /metrics API
