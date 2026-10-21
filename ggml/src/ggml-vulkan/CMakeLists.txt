@@ -35,25 +35,31 @@ endfunction()
 #  EXTENSION_NAME - Name of the extension to test (e.g., "GL_EXT_integer_dot_product")
 #  TEST_SHADER_FILE - Path to the test shader file
 #  RESULT_VARIABLE - Name of the variable to set (ON/OFF) based on test result
+#  Optional fourth argument disables the extension test and shader variants.
 function(test_shader_extension_support EXTENSION_NAME TEST_SHADER_FILE RESULT_VARIABLE)
-    execute_process(
-        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.3 "${TEST_SHADER_FILE}"
-        OUTPUT_VARIABLE glslc_output
-        ERROR_VARIABLE glslc_error
-    )
-
-    if (${glslc_error} MATCHES ".*extension not supported: ${EXTENSION_NAME}.*")
-        message(STATUS "${EXTENSION_NAME} not supported by glslc")
-        set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
+    set(shader_support OFF)
+    if (ARGC GREATER 3 AND ARGV3)
+        message(STATUS "${EXTENSION_NAME} disabled")
     else()
-        message(STATUS "${EXTENSION_NAME} supported by glslc")
-        set(${RESULT_VARIABLE} ON PARENT_SCOPE)
-        add_compile_definitions(${RESULT_VARIABLE})
-
-        # Ensure the extension support is forwarded to vulkan-shaders-gen
-        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -D${RESULT_VARIABLE}=ON)
-        set(VULKAN_SHADER_GEN_CMAKE_ARGS "${VULKAN_SHADER_GEN_CMAKE_ARGS}" PARENT_SCOPE)
+        execute_process(
+            COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.3 "${TEST_SHADER_FILE}"
+            OUTPUT_VARIABLE glslc_output
+            ERROR_VARIABLE glslc_error
+        )
+        if (NOT "${glslc_error}" MATCHES ".*extension not supported: ${EXTENSION_NAME}.*")
+            set(shader_support ON)
+        endif()
     endif()
+
+    if (shader_support)
+        message(STATUS "${EXTENSION_NAME} supported by glslc")
+        add_compile_definitions(${RESULT_VARIABLE})
+    elseif (NOT (ARGC GREATER 3 AND ARGV3))
+        message(STATUS "${EXTENSION_NAME} not supported by glslc")
+    endif()
+    set(${RESULT_VARIABLE} ${shader_support} PARENT_SCOPE)
+    list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -D${RESULT_VARIABLE}=${shader_support})
+    set(VULKAN_SHADER_GEN_CMAKE_ARGS "${VULKAN_SHADER_GEN_CMAKE_ARGS}" PARENT_SCOPE)
 endfunction()
 
 if (Vulkan_FOUND)
@@ -81,18 +87,21 @@ if (Vulkan_FOUND)
         "GL_KHR_cooperative_matrix"
         "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat.comp"
         "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT"
+        ${GGML_VULKAN_NO_COOPMAT}
     )
 
     test_shader_extension_support(
         "GL_NV_cooperative_matrix2"
         "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2.comp"
         "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
+        ${GGML_VULKAN_NO_COOPMAT2}
     )
 
     test_shader_extension_support(
         "GL_NV_cooperative_matrix_decode_vector"
         "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2_decode_vector.comp"
         "GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT"
+        ${GGML_VULKAN_NO_COOPMAT2}
     )
 
     test_shader_extension_support(
