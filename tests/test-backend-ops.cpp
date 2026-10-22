@@ -12470,6 +12470,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Gemma 4 12B shapes: FFN up/gate, FFN down, attention q, output projection
+    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ {15360, 3840}, {3840, 15360}, {4096, 3840}, {262144, 3840}, {512, 3840}, {2048, 3840} }) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_F16}) {
+            for (int bs : {1, 4, 128}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk.first, bs, mk.second, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // Q4_K multi-column mat-vec
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {

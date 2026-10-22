@@ -1793,12 +1793,19 @@ struct block_iq4_xs_packed32
     uint32_t qs[QUANT_K_IQ4_XS/8];
 };
 
+struct block_iq4_xs_packed64
+{
+    u32vec2 hdr;     // d | scales_h << 16, scales_l
+    u32vec2 qs[16];
+};
+
 #if defined(DATA_A_IQ4_XS)
 #define QUANT_K QUANT_K_IQ4_XS
 #define QUANT_R QUANT_R_IQ4_XS
 #define A_TYPE block_iq4_xs
 #define A_TYPE_PACKED16 block_iq4_xs_packed16
 #define A_TYPE_PACKED32 block_iq4_xs_packed32
+#define A_TYPE_PACKED64 block_iq4_xs_packed64
 #endif
 
 #define QUANT_K_IQ4_NL 32

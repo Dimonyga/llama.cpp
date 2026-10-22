@@ -11,47 +11,68 @@ FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 // dedicated iq4_xs mat-vec, mirrors mul_mat_vec_iq3_s.comp
 // one packed32 word per l, so the 6-bit subblock scale is hoisted to a single fma after register accumulation
 
-void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
-    const uint y_idx = i * QUANT_K + 32 * ib32;
+// 16 threads per superblock, each owns one 8 byte chunk of the quants (16 weights): the threads of a block read 128 contiguous bytes
+void calc_superblock(const uint a_offset, const uint b_offset, const uint c, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+    const uint ib32 = c / 2;
+    const uint half_sb = c % 2;
+    const uint y_idx = i * QUANT_K + 32 * ib32 + 8 * half_sb;
 
-    uint ibi = a_offset + first_row * num_blocks_per_row + i;
-    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const float d = float(data_a[ibi].d);
-        const uint sl = (data_a[ibi].scales_l[ib32/2] >> (4 * (ib32 & 1))) & 0xF;
-        const uint sh = (data_a[ibi].scales_h >> (2 * ib32)) & 3;
-        const float dscale = d * float(int(sl | (sh << 4)) - 32);
+    const uint ibi0 = a_offset + first_row * num_blocks_per_row + i;
 
-        FLOAT_TYPE sum[NUM_COLS];
+    float dscale[NUM_ROWS];
+    u32vec2 wq[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        dscale[n] = 0.0;
+        wq[n] = u32vec2(0);
+        if (n < num_rows) {
+            const uint ibi = ibi0 + n * num_blocks_per_row;
+            const u32vec2 hdr = data_a_packed64[ibi].hdr;
+            const float d = unpackHalf2x16(hdr.x).x;
+            const uint sl = ((hdr.y >> (8 * (ib32 / 2))) >> (4 * (ib32 & 1))) & 0xF;
+            const uint sh = ((hdr.x >> 16) >> (2 * ib32)) & 3;
+            dscale[n] = d * float(int(sl | (sh << 4)) - 32);
+            wq[n] = data_a_packed64[ibi].qs[c];
+        }
+    }
+
+    FLOAT_TYPE sum[NUM_ROWS][NUM_COLS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            sum[j] = FLOAT_TYPE(0);
+            sum[n][j] = FLOAT_TYPE(0);
         }
+    }
 
-        [[unroll]] for (uint l = 0; l < 4; ++l) {
-            const uint w = data_a_packed32[ibi].qs[4 * ib32 + l];
-            const u8vec4 q0 = unpack8(w & 0x0F0F0F0F);
-            const u8vec4 q1 = unpack8((w >> 4) & 0x0F0F0F0F);
+    // activations of all columns, then every row is dequantized once and applied to all columns
+    vec4 bv[NUM_COLS][4];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        const uint bi = (j*p.batch_stride_b + b_offset + y_idx) / 4;
+        bv[j][0] = vec4(data_b_v4[bi]);
+        bv[j][1] = vec4(data_b_v4[bi + 1]);
+        bv[j][2] = vec4(data_b_v4[bi + 4]);
+        bv[j][3] = vec4(data_b_v4[bi + 5]);
+    }
 
-            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                const vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + l]);
-                const vec4 b1 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 4 + l]);
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        const u8vec4 q0 = unpack8(wq[n].x & 0x0F0F0F0F);
+        const u8vec4 q1 = unpack8((wq[n].x >> 4) & 0x0F0F0F0F);
+        const u8vec4 q2 = unpack8(wq[n].y & 0x0F0F0F0F);
+        const u8vec4 q3 = unpack8((wq[n].y >> 4) & 0x0F0F0F0F);
 
-                sum[j] = fma(FLOAT_TYPE(b0.x), FLOAT_TYPE(kvalues_iq4nl[q0.x]),
-                        fma(FLOAT_TYPE(b0.y), FLOAT_TYPE(kvalues_iq4nl[q0.y]),
-                        fma(FLOAT_TYPE(b0.z), FLOAT_TYPE(kvalues_iq4nl[q0.z]),
-                        fma(FLOAT_TYPE(b0.w), FLOAT_TYPE(kvalues_iq4nl[q0.w]),
-                        fma(FLOAT_TYPE(b1.x), FLOAT_TYPE(kvalues_iq4nl[q1.x]),
-                        fma(FLOAT_TYPE(b1.y), FLOAT_TYPE(kvalues_iq4nl[q1.y]),
-                        fma(FLOAT_TYPE(b1.z), FLOAT_TYPE(kvalues_iq4nl[q1.z]),
-                        fma(FLOAT_TYPE(b1.w), FLOAT_TYPE(kvalues_iq4nl[q1.w]),
-                        sum[j]))))))));
-            }
-        }
+        // weights 8h..8h+7 (q0, q2) and 16+8h..16+8h+7 (q1, q3) of the sub-block
+        const vec4 dq0 = vec4(kvalues_iq4nl[q0.x], kvalues_iq4nl[q0.y], kvalues_iq4nl[q0.z], kvalues_iq4nl[q0.w]);
+        const vec4 dq1 = vec4(kvalues_iq4nl[q2.x], kvalues_iq4nl[q2.y], kvalues_iq4nl[q2.z], kvalues_iq4nl[q2.w]);
+        const vec4 dq2 = vec4(kvalues_iq4nl[q1.x], kvalues_iq4nl[q1.y], kvalues_iq4nl[q1.z], kvalues_iq4nl[q1.w]);
+        const vec4 dq3 = vec4(kvalues_iq4nl[q3.x], kvalues_iq4nl[q3.y], kvalues_iq4nl[q3.z], kvalues_iq4nl[q3.w]);
 
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            temp[j][n] = fma(dscale, sum[j], temp[j][n]);
+            sum[n][j] = FLOAT_TYPE(dot(bv[j][0], dq0) + dot(bv[j][1], dq1) + dot(bv[j][2], dq2) + dot(bv[j][3], dq3));
         }
+    }
 
-        ibi += num_blocks_per_row;
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            temp[j][n] = fma(FLOAT_TYPE(dscale[n]), sum[n][j], temp[j][n]);
+        }
     }
 }
 
@@ -62,11 +83,11 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 
     const uint num_blocks_per_row = p.ncols / QUANT_K;
 
-    // 8 threads are used to process each block
-    const uint blocks_per_wg = gl_WorkGroupSize.x/8;
+    // 16 threads are used to process each block
+    const uint blocks_per_wg = gl_WorkGroupSize.x/16;
     const uint tid = gl_LocalInvocationID.x;
-    const uint itid = tid % 8;  // 0...7
-    const uint ix = tid / 8;
+    const uint c = tid % 16;  // 0...15
+    const uint ix = tid / 16;
 
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
@@ -75,7 +96,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     }
 
     [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += blocks_per_wg)
-        calc_superblock(a_offset, b_offset, itid, i, num_blocks_per_row, first_row, num_rows);
+        calc_superblock(a_offset, b_offset, c, i, num_blocks_per_row, first_row, num_rows);
 
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
