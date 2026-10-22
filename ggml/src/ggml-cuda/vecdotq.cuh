@@ -1423,9 +1423,20 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq + kbx;
 
     int sumi = 0;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
+    // qs starts 8 bytes into the 136 byte block, so 64 bit loads are aligned. Fewer load instructions help on Pascal.
+    const int2 * qs2 = (const int2 *) bq4->qs + iqs/2;
+    const int2 w0 = qs2[0];
+    const int2 w1 = qs2[1];
+    const int aux[4] = { w0.x, w0.y, w1.x, w1.y };
+#endif
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
+        const int aux_q4 = aux[j];
+#else
         const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+#endif
         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
 
         const int u0 = get_int_b4(bq8_1[iqs/4].qs, j + 0);

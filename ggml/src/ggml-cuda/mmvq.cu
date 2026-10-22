@@ -455,10 +455,19 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
+// IQ4_XS on dp4a-only NVIDIA parts is limited by the memory-level parallelism of one row per warp, more rows per block
+// (and a single warp for small batches) are faster there.
+static constexpr __host__ __device__ bool mmvq_rows_scaled_pascal(ggml_type type, int table_id) {
+    return type == GGML_TYPE_IQ4_XS && table_id == MMVQ_PARAMETERS_PASCAL_DP4A;
+}
+
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_PASCAL_DP4A) {
         if (table_id == MMVQ_PARAMETERS_PASCAL_DP4A && ncols_dst == 1) {
             return 2;
+        }
+        if (mmvq_rows_scaled_pascal(type, table_id) && ncols_dst >= 2 && ncols_dst <= 8) {
+            return 1;
         }
         switch (ncols_dst) {
             case 1:
@@ -611,7 +620,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
                 if (table_id == MMVQ_PARAMETERS_GB10) {
                     return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_S ? 2 : 1;
                 }
-                return (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_PASCAL_DP4A) && mmvq_two_rows_ncols1(type) ? 2 : 1;
+                return (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_PASCAL_DP4A) &&
+                    (mmvq_two_rows_ncols1(type) || mmvq_rows_scaled_pascal(type, table_id)) ? 2 : 1;
             case 2:
             case 3:
             case 4:
@@ -619,7 +629,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             case 6:
             case 7:
             case 8:
-                return 2;
+                return mmvq_rows_scaled_pascal(type, table_id) ? 4 : 2;
             default:
                 return 1;
         }
