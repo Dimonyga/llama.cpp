@@ -1700,7 +1700,7 @@ struct test_case {
 
             // re-draw any data-dependent inputs (expert ids) outside the timed region
             reinit_perf_iter(ctx.get());
-        } while (total_time_us < 1000*1000); // run for at least 1 second
+        } while (total_time_us < (getenv("TBO_MIN_US") ? atoll(getenv("TBO_MIN_US")) : 1000*1000)); // run for at least 1 second
 
         // Create test result
         double avg_time_us      = (double) total_time_us / total_runs;
@@ -12449,10 +12449,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 2048, 16, 5, 4 }));
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 20000, 10, 4, 1 }));
 
-    for (int bs : {1, 2, 3, 4, 5, 8, 512}) {
+    for (int bs : {1, 2, 3, 4, 5, 8, 512, 1024, 2048, 4096}) {
         for (ggml_type type_a : all_types) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 17408, bs, 5120, {1,  1}, {1, 1})); // 27B ffn up/gate
             }
         }
     }
