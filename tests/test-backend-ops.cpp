@@ -11799,6 +11799,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // single token decode with a q4_0 KV cache over the GQA ratios and head sizes of the dp4a kernel, with enough KV
+    // positions that its range is split over several blocks
+    for (int hs : { 64, 128, 256, }) {
+        for (int nr2 : { 2, 4, 6, 8, }) {
+            for (int kv : { 256, 2048, 16384, }) {
+                for (bool mask : { false, true, }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {nr2, 1}, kv, 1, mask, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+                }
+            }
+        }
+    }
+
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
     for (int kv : { 1024, 2048, }) {
@@ -12515,6 +12527,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // Dense flash attention with a q4_0 KV cache at Qwen3.x 27B-class shapes (24 q heads, 4 kv heads, head size 256):
+    // decode (nb = 1) and a 256 token ubatch across context depths
+    for (int64_t kv : {1024, 4096, 16384, 65536, 131072, 262144}) {
+        for (int nb : {1, 256}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        }
+    }
 
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.
