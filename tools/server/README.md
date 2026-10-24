@@ -859,6 +859,8 @@ Returns raw audio bytes (`audio/wav` by default) rather than JSON. For more info
 
 `lang`: Language code for the utterance (model-dependent, e.g. `en`, `zh`). Optional.
 
+`instruct`: Text description of the voice to synthesize, for example `"A cheerful young woman"` (alias: `instructions`). Optional. Meant for VoiceDesign models; other models are not trained for it and give unpredictable results. A VoiceDesign model has no speaker encoder, so it rejects `speaker_ref`. The voice is sampled per request, so repeated requests with the same description give similar but not identical voices.
+
 `speaker_ref_b64`: Base64-encoded reference audio to clone the speaker's voice. Optional. Alternatively, upload the reference audio as a `speaker_ref` file field via `multipart/form-data` (see example below) - if both are provided, the uploaded file takes precedence.
 
 `top_k`, `top_p`: Sampling params for the acoustic code predictor. Optional, model-dependent defaults apply.

@@ -201,6 +201,20 @@ public:
         ids.resize((size_t) n_ids);
 
         std::vector<std::vector<float>> prompt;
+
+        // VoiceDesign: the instruction is a plain user turn in front of the assistant turn
+        if (inp->instruct && inp->instruct[0]) {
+            const std::string instruct = std::string("<|im_start|>user\n") + inp->instruct + "<|im_end|>\n";
+            std::vector<llama_token> instruct_ids(instruct.size() + 16);
+            const int n_instruct = llama_tokenize(vocab, instruct.c_str(), (int32_t) instruct.size(),
+                                                  instruct_ids.data(), (int32_t) instruct_ids.size(), false, true);
+            if (n_instruct <= 0) {
+                LOG_ERR("mtmd_helper_gen_audio: instruct tokenization failed\n");
+                return 1;
+            }
+            for (int i = 0; i < n_instruct; i++) prompt.push_back(row(instruct_ids[(size_t) i]));
+        }
+
         for (int i = 0; i < 3; i++) prompt.push_back(row(ids[(size_t) i]));
         prompt.push_back(sum_row(tts_pad, c_think));
         prompt.push_back(sum_row(tts_pad, c_think_b));

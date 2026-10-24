@@ -35,6 +35,8 @@ llama-tts -hf ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF \
     --output out.wav
 ```
 
+VoiceDesign models take a voice description in the `instruct` field of the server [`/tts`](../server/README.md#post-tts-generate-speech-audio-from-text) request. It is not available in this CLI.
+
 ## Pocket TTS
 
 Available params:

@@ -6639,6 +6639,7 @@ void server_routes::init_routes() {
         const bool stream = task.params.stream;
         task.tts_inp.set_prompt(prompt);
         task.tts_inp.set_lang(json_value(body, "lang", std::string()));
+        task.tts_inp.set_instruct(json_value(body, "instruct", json_value(body, "instructions", std::string())));
         task.tts_inp.data.stream    = stream;
         task.tts_inp.data.out_type  = response_format == "pcm"
             ? MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM
@@ -6677,13 +6678,17 @@ void server_routes::init_routes() {
         }
 
         if (speaker_ref_len > 0) {
+            if (!mtmd_support_audio(ctx_server.mctx)) {
+                res->error(format_error_response("this model has no speaker encoder, \"speaker_ref\" is not supported", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
             auto wrapper = mtmd_helper_bitmap_init_from_buf(ctx_server.mctx, speaker_ref_data, speaker_ref_len, false, ctx_server.init_opt);
             if (!wrapper.bitmap) {
                 res->error(format_error_response("failed to decode \"speaker_ref\"", ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
             task.tts_inp.set_speaker_ref(mtmd::bitmap_ptr(wrapper.bitmap));
-        } else {
+        } else if (task.tts_inp.instruct_str.empty()) {
             SRV_WRN("%s", "no speaker reference provided, the model may behave randomly\n");
         }
 
